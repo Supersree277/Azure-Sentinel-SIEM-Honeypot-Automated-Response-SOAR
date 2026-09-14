@@ -12,9 +12,11 @@ I also wanted to explore SOAR (Security Orchestration, Automation, and Response)
 * **Microsoft Sentinel**: SIEM (Security Information and Event Management).
 * **Azure Log Analytics Workspace (LAW)**: Ingesting and querying logs (KQL).
 * **Azure Logic Apps**: Orchestration and automation (SOAR).
-* **PowerShell**: Scripting to disable firewalls and configure the VM.
-* **KQL (Kusto Query Language)**: Writing custom analytics rules.
-
+* **PowerShell**: Scripting to disable firewalls, handle legacy Azure module schemas, and configure the VM.
+* **Python**: Ingestion pipeline using `azure-monitor-query`, `azure-identity`, and SQLite ORM logic.
+* **SQL / SQLite**: Relational schema design, session management, and aggregated metric reporting.
+* **REST APIs**: AbuseIPDB v2 API integration for reputation scoring and metadata enrichment.
+* **KQL (Kusto Query Language)**: Writing custom analytics rules and log parsing filters.
 ---
 
 
@@ -171,10 +173,10 @@ By the end of the lab, the map was lighting up with thousands of attacks from al
 
 ### 1. Architecture Design
 I configured a **Logic App** (Playbook) to act as the orchestrator. The workflow uses the following logic:
-1.  **Trigger:** When a Microsoft Sentinel Incident is created.
-2.  **Action:** Extract the IP address entity from the incident.
-3.  **Notification:** Send a message to Microsoft Teams to alert the security analyst (me).
-4.  **Remediation:** Trigger an Azure Automation Runbook (PowerShell) to block the IP.
+1. **Trigger:** When a Microsoft Sentinel Incident is created.
+2. **Action:** Extract the IP address entity from the incident.
+3. **Notification:** Send a message to Microsoft Teams to alert the security analyst (me).
+4. **Remediation:** Trigger an Azure Automation Runbook (PowerShell) to block the IP.
 
 ![Logic App Workflow](Images/image14)
 *The updated Logic App chain: Trigger -> Get IPs -> Loop -> Teams Alert -> Blocking Script.*
@@ -193,54 +195,236 @@ I configured a **Logic App** (Playbook) to act as the orchestrator. The workflow
 
 ### 3. The PowerShell Logic
 The Runbook performs the following steps:
-1.  Authenticates using a Managed Identity.
-2.  Retrieves the current Network Security Group (NSG).
-3.  Checks if the "Sentinel-Blocklist-Auto" rule exists.
-    * *If yes:* It appends the new attacker IP to the existing list.
-    * *If no:* It creates the rule and adds the first IP.
-4.  Updates the NSG configuration in Azure.
+1. Authenticates using a Managed Identity.
+2. Retrieves the current Network Security Group (NSG).
+3. Checks if the "Sentinel-Blocklist-Auto" rule exists.
+   * *If yes:* It appends the new attacker IP to the existing list.
+   * *If no:* It creates the rule and adds the first IP.
+4. Updates the NSG configuration in Azure.
 
 ### 4. Final Results
 The system successfully blocked malicious IPs from China and the Netherlands automatically.
 * **Time to Response:** Reduced from minutes/hours (manual) to ~3 seconds (automated).
-* **Verification:** The NSG "Inbound Security Rules" now shows a `Sentinel-Blocklist-Auto` rule containing a growing list of blocked IPs.*
-
-
+* **Verification:** The NSG "Inbound Security Rules" now shows a `Sentinel-Blocklist-Auto` rule containing a growing list of blocked IPs.
 
 ![Automation Job Success](Images/image16)
 *Evidence of the Automation working: The NSG rule automatically populated with the attacker IPs.*
 
 
+
+
+
+## Phase 8: The V2 Upgrade (Threat Intelligence Pipeline & Local Database)
+*Project Update (Fall 2026):* After running the honeypot and watching the automated response work, I realized two major limitations with relying fully on the cloud dashboard:
+
+1. **The Retention Cliff:** Azure Log Analytics workspaces drop logs after 30 to 90 days on standard student tiers. Once retention expired, my raw telemetry vanished, including all the attacks that I had at the beginning of the year.
+2. **Context Blindspots:** Event 4625 told me someone failed a login, but gave me zero external context on who they were, what ASN or ISP they were leasing from, or whether they were an established threat actor.
+
+To solve this, I decided to bridge cloud security with software engineering. I built a Python pipeline to pull logs directly from Azure Monitor, correlate malicious IPs against an external threat intelligence platform (AbuseIPDB), store the enriched data into a relational database, and query it from a local CLI.
+
+```text
+┌─────────────────────────────────────────────────────────┐
+│              Azure Cloud Honeypot (West US 3)           │
+│  [Windows Server 2022] ──(Failed Logons)──> Event 4625  │
+└────────────────────────────┬────────────────────────────┘
+                             │ Azure Monitor Agent (AMA)
+                             ▼
+┌─────────────────────────────────────────────────────────┐
+│        Azure Log Analytics Workspace (LAW-Cyber-Lab)    │
+│            KQL Parsing & RFC 1918 IP Validation         │
+└────────────────────────────┬────────────────────────────┘
+                             │ Python SDK (azure-monitor-query)
+                             ▼
+┌─────────────────────────────────────────────────────────┐
+│       Automated Threat Intelligence Ingestion Engine    │
+│               [pipeline/enrichment_pipeline.py]         │
+└──────────────┬───────────────────────────┬──────────────┘
+               │ REST API Query            │ Normalized Upsert
+               ▼                           ▼
+┌─────────────────────────────┐ ┌─────────────────────────┐
+│     AbuseIPDB REST API      │ │  SQLite Threat Database │
+│ - Reputation Confidence     │ │   [threat_intelligence] │
+│ - ISP / Country Metadata    │ │ - attackers (PK: IP)    │
+│ - Historical Abuse Reports  │ │ - attack_events (FK)    │
+└─────────────────────────────┘ └───────────┬─────────────┘
+                                            │ SQL Queries
+                                            ▼
+                                ┌─────────────────────────┐
+                                │ CLI Analytical Engine   │
+                                │ [pipeline/threat_CLI.py]│
+                                │ --top 5 | --high-risk 50│
+                                └─────────────────────────┘
+```
+*High-level data flow: honeypot telemetry → Log Analytics → enrichment pipeline → SQLite → CLI.*
+
+### 1. Ingestion Pipeline & Cloud Telemetry (`enrichment_pipeline.py`)
+To get fresh telemetry for this phase, I verified that port 3389 was open on the Network Security Group and confirmed inbound connectivity using `Test-NetConnection`.
+
+![RDP Port Exposure](Images/Image17)
+*Exposing RDP port 3389 publicly via NSG rules to bait threat actors.*
+
+![TCP Reachability Test](Images/Image18)
+*Verifying end-to-end TCP reachability on RDP port 3389 using Test-NetConnection.*
+
+Instead of manually exporting CSVs, I wrote `enrichment_pipeline.py` using the `azure-monitor-query` SDK and authenticated with `DefaultAzureCredential`. To avoid pulling internal test traffic, I built RFC 1918 filtering directly into the KQL query:
+
+```kql
+SecurityEvent
+| where EventID == 4625
+| where isnotempty(IpAddress) and IpAddress != "-" 
+| where ipv4_is_private(IpAddress) == false
+| summarize AttackCount = count(), LastSeen = max(TimeGenerated) by IpAddress
+| top 10 by AttackCount desc
+```
+
+![Log Analytics Query Results](Images/Image19)
+*Validating real-time brute-force logon failures (Event 4625) inside Log Analytics Workspace.*
+
+### 2. Live IOC Enrichment & The Zero-Score Anomaly
+The script passes extracted IPs to the AbuseIPDB REST API v2, gathering each actor's Abuse Confidence Score, registered ISP, country code, and historical report count.
+
+```text
+[*] Processing 120.25.120.254 (Hits: 1480)...
+    └── Saved 120.25.120.254 (CN) to local database.
+[*] Processing 156.236.110.101 (Hits: 1039)...
+    └── Saved 156.236.110.101 (HK) to local database.
+[*] Processing 185.204.169.233 (Hits: 1)...
+    └── Saved 185.204.169.233 (DE) to local database.
+```
+
+**Real-World Takeaway (The Zero-Score Anomaly):** While pulling data, IP `156.236.110.101` hit my honeypot over 1,000 times from Hong Kong, but returned an Abuse Confidence Score of **0%** with zero reports.
+
+* Attackers frequently cycle through cheap or bulletproof VPS providers, run short automated sweeps, and tear down instances before threat databases register community reports.
+* This showed me firsthand why static reputation feeds cannot be trusted alone; how aggressively an IP is currently attacking matters just as much as what a public database says about it.
+
+![IOC Enrichment Output](Images/Image20)
+*Ingesting Azure telemetry, enriching external indicators, and resolving the zero-score anomaly.*
+
+### 3. Database Architecture (`database.py`)
+Rather than dumping everything into flat text files, I split the database into a normalized two-table relational schema (attackers and attack_events) linked by foreign keys. This prevented repetitive IP metadata from bloating the database every time a brute-force sweep occurred, while Python context managers handled clean commits to prevent file-locking crashes:
+
+* **`attackers` Table (Master):** Stores `ip_address` (Primary Key), country, ISP, abuse score, total reports, and timestamps.
+* **`attack_events` Table (Telemetry):** Stores `event_id` (Primary Key), `ip_address` (Foreign Key linked to `attackers` with `ON DELETE CASCADE`), attack volume, target port (3389), and logged timestamp.
+
+```sql
+CREATE TABLE IF NOT EXISTS attackers (
+    ip_address TEXT PRIMARY KEY,
+    country TEXT,
+    isp TEXT,
+    abuse_score INTEGER,
+    total_reports INTEGER,
+    first_seen TIMESTAMP,
+    last_seen TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS attack_events (
+    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ip_address TEXT,
+    attack_count INTEGER,
+    target_port INTEGER DEFAULT 3389,
+    recorded_at TIMESTAMP,
+    FOREIGN KEY (ip_address) REFERENCES attackers (ip_address) ON DELETE CASCADE
+);
+```
+
+**Transaction Handling & Upserts:** I wrapped connection handling inside Python's `@contextmanager` to ensure connections close cleanly and prevent database locking on Windows. To avoid primary key collision errors on repeated pipeline runs, I implemented SQLite's `ON CONFLICT(ip_address) DO UPDATE SET` logic to update metadata cleanly.
+
+![SQLite Schema Validation](Images/Image21)
+*Inspecting normalized relational records and foreign key associations inside SQLite Viewer.*
+
+### 4. Threat Hunting Analytical CLI (`threat_CLI.py`)
+To query the database without opening a raw database console, I built `threat_CLI.py` using `argparse`.
+
+**Top Attackers by Volume (`--top`):** Runs an inner JOIN between both tables, grouping by actor and summing counts to reveal total brute-force volume across runs.
+
+```powershell
+python pipeline/threat_CLI.py --top 5
+```
+
+![Threat CLI Top Attackers](Images/Image22)
+*Running `--top 5` to aggregate hit volume and surface persistent threat campaigns.*
+
+**Filtering Malicious Thresholds (`--high-risk`):** Filters indicators against a minimum AbuseIPDB confidence score to quickly isolate high-priority threats.
+
+```powershell
+python pipeline/threat_CLI.py --high-risk 50
+```
+
+![Threat CLI High-Risk Query](Images/Image23)
+*Running `--high-risk 50` to isolate high-confidence malicious actors.*
+
+### 5. Final Results
+My pipeline successfully pulled, enriched, and stored active brute-force telemetry entirely outside the Azure portal!
+* **Data Permanence:** Threat indicators and attack counts are preserved locally, eliminating reliance on Azure's log retention window.
+* **Actionable Intelligence:** Confirmed hits from established malicious hosts (like Arvancloud in Germany at a 100% abuse score) alongside brand-new scanning hosts with 0% reputation scores.
+* **Rapid Triage:** The CLI provides command-line flags (--top, --high-risk) to quickly inspect top threat actors and high-risk indicators directly from the terminal without writing raw SQL queries.
+
+### Setup & Execution
+Clone the repository:
+```powershell
+git clone https://github.com/Supersree277/Azure-Sentinel-SIEM-Honeypot-Automated-Response-SOAR-.git
+cd Azure-Sentinel-SIEM-Honeypot-Automated-Response-SOAR-
+```
+
+Set up virtual environment & install dependencies:
+```powershell
+python -m venv venv
+.\venv\Scripts\Activate
+python -m pip install -r requirements.txt
+```
+
+Configure environment variables:
+```powershell
+$env:AZURE_WORKSPACE_ID="your-log-analytics-workspace-guid"
+$env:ABUSEIPDB_API_KEY="your-abuseipdb-api-key"
+```
+
+Execute pipeline & query CLI:
+```powershell
+python pipeline/enrichment_pipeline.py
+python pipeline/threat_CLI.py --top 5
+python pipeline/threat_CLI.py --high-risk 50
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 ## Skills Learned
 
 * **Cloud Infrastructure:** Hands-on experience deploying and configuring Azure resources, including Virtual Machines, Virtual Networks, and Network Security Groups.
-* **SIEM Administration:** Configuring Microsoft Sentinel, connecting data sources (Log Analytics Workspace), and managing data collection rules.
-* **KQL (Kusto Query Language):** Writing complex queries to filter logs, extract key data (IP addresses), and generate custom analytics rules.
-* **Azure Automation:** Configuring Runbooks, Managed Identities, and integrating PowerShell scripts with Logic Apps for custom infrastructure management.
-* **PowerShell Scripting:** Writing resilient scripts to handle Azure module version conflicts, input sanitization (Regex), and error handling (try/catch) for production-grade reliability.
-* **SOAR & Automation:** Designing automated workflows using Azure Logic Apps to bridge the gap between security detection and incident response.
-* **Network Security:** Understanding firewall management (Windows Defender Firewall) and public/private IP networking concepts.
-* **Troubleshooting:** Diagnosing and resolving real-world deployment issues, including region-specific policy restrictions, API connector limitations, and module version conflicts.
-
-
+* **SIEM Administration:** Configuring Microsoft Sentinel, connecting data sources (Log Analytics Workspace), and managing Data Collection Rules (DCR).
+* **KQL (Kusto Query Language):** Writing custom queries to filter event logs, extract IP entities, and isolate external non-RFC 1918 traffic.
+* **Azure Automation & SOAR:** Configuring Automation Accounts, Runbooks, Managed Identities, and integrating PowerShell with Logic Apps for sub-3-second automated incident response.
+* **PowerShell Scripting:** Writing resilient scripts to handle legacy Azure module version conflicts, input sanitization (Regex), and error handling (`try/catch`).
+* **Software & Pipeline Engineering:** Building modular Python ingestion pipelines using official cloud SDKs (`azure-monitor-query`), integrating third-party REST APIs (AbuseIPDB), and managing environment dependencies.
+* **Relational Database Design:** Designing two-table schemas linked by foreign keys in SQLite, preventing file locks with Python context managers, and writing idempotent `UPSERT` queries.
+* **Threat Hunting & CLI Tooling:** Engineering interactive command-line triage tools using `argparse` and SQL aggregation queries (`JOIN`, `GROUP BY`, `SUM`) to surface attack velocity and high-risk indicators.
+* **Troubleshooting:** Resolving real-world cloud deployment blockers, including subscription policy restrictions, API connector firewalls, and schema version mismatches.
 
 ## Future Improvements
 
-* **Email Integration:** Integrate Outlook or Gmail connectors to send detailed email reports to security admins (currently restricted by Azure for Students policy).
-* **IP Retention Policy:** Implement logic to clear blocked IPs after a set period (e.g., 30 days) to prevent the NSG from hitting its maximum capacity limit.
-* **Advanced Analytics:** Develop more sophisticated KQL rules to detect other attack vectors beyond Brute Force (e.g., Port Scanning, Privilege Escalation).
-* **Threat Intelligence:** Connect Sentinel to external threat intelligence feeds to correlate attacker IPs with known malicious actors.
+* **Automated IP Expiration (Pruning):** Build a scheduled runbook to expire and unblock IPs after 30 days so the Azure NSG rule doesn't hit its maximum prefix capacity limit.
+* **Multi-Port Honeypot Ingestion:** Expand the KQL ingestion logic and database schema to track attacks across other bait ports, such as SSH (22) and SMB (445).
+* **STIX/TAXII Threat Sharing:** Add an export module to package local threat indicators into standardized STIX/TAXII feeds to share with external threat intelligence platforms or MISP.
+* **Automated Alert Digest:** Configure a weekly script to generate and email a markdown/PDF summary of new high-risk indicators discovered.
 
 
 
+<sub>Project Start: 12/19/2025<sub>
 
+<sub>Project End (Part I - Cloud Honeypot & SIEM): 12/24/2025<sub>
 
-<sub>Project Start: 12/19/2025</sub>
+<sub>Project End (Part II - SOAR Automated Blocking): 01/02/2026<sub>
 
-
-
-<sub>Project End (Part I): 12/24/2025</sub>
-
-
-<sub>Project End (Part II): 1/2/2026</sub>
+<sub>Project End (Part III - Threat Intel Pipeline & Database Engine): 09/13/2026<sub>
 
